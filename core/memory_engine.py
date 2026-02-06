@@ -14,8 +14,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration constants
-DB_PATH = os.getenv('MEMORY_DB_PATH', '/root/.openclaw/workspace/memory.db')
-INDEX_PATH = os.getenv('MEMORY_INDEX_PATH', '/root/.openclaw/workspace/memory.index')
+DB_PATH = os.getenv('MEMORY_DB_PATH', '/root/.openclaw/workspace/data/memory.db')
+INDEX_PATH = os.getenv('MEMORY_INDEX_PATH', '/root/.openclaw/workspace/data/memory.index')
 EMB_DIM = int(os.getenv('MEMORY_EMB_DIM', '768'))
 AUTO_SAVE_INTERVAL = int(os.getenv('INDEX_SAVE_INTERVAL', '100'))  # Save every N operations
 POOL_SIZE = int(os.getenv('DB_POOL_SIZE', '5'))
