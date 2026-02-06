@@ -1,0 +1,3 @@
+# Keep this directory in git but ignore generated data files
+*
+!.gitkeep

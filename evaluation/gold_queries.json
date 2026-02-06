@@ -1,0 +1,10 @@
+[
+  {
+    "query": "machine learning evaluation",
+    "expected_ids": [1, 2, 3]
+  },
+  {
+    "query": "semantic search performance",
+    "expected_ids": [4, 5]
+  }
+]

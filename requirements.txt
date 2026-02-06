@@ -1,0 +1,10 @@
+# Required
+numpy
+faiss-cpu
+
+# Optional – for clustering and summaries
+scikit-learn
+hdbscan
+
+# Optional – for PostgreSQL backend
+sqlalchemy
