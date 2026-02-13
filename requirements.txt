@@ -20,6 +20,7 @@ slowapi
 
 # ML/NLP
 sentence-transformers
+onnxruntime  # CPU-optimized inference
 
 # Testing
 pytest
