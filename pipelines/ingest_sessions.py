@@ -45,6 +45,7 @@ import time
 import logging
 import hashlib
 import argparse
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -69,7 +70,11 @@ log = logging.getLogger("ingest_sessions")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "768"))
+EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "384"))
+
+EMBEDDING_SERVER_HOST = os.getenv('EMBEDDING_SERVER_HOST', 'localhost')
+EMBEDDING_SERVER_PORT = int(os.getenv('EMBEDDING_SERVER_PORT', '9999'))
+EMBEDDING_SERVER_URL = f"http://{EMBEDDING_SERVER_HOST}:{EMBEDDING_SERVER_PORT}"
 
 # Chunk-size guardrails (characters)
 MIN_CHUNK_LEN = 200
@@ -103,28 +108,21 @@ RE_HEADING = re.compile(r"^#{1,6}\s+", re.MULTILINE)
 # ---------------------------------------------------------------------------
 
 def embed_text(text: str) -> List[float]:
-    """Generate embedding via Ollama HTTP API. Falls back to random vector."""
+    """Generate embedding via embedding server API (384-dim).
+    Falls back to deterministic hash-seeded random vector."""
     try:
-        import subprocess
-        payload = json.dumps({"model": "nomic-embed-text", "input": text[:2000]})
-        result = subprocess.check_output(
-            [
-                "curl", "-s", "-X", "POST",
-                "http://localhost:11434/api/embed",
-                "-d", payload,
-                "-H", "Content-Type: application/json",
-            ],
-            text=True,
-            timeout=30,
+        req = urllib.request.Request(
+            EMBEDDING_SERVER_URL,
+            data=json.dumps({'text': text[:2000]}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
         )
-        data = json.loads(result)
-        embedding = data.get("embeddings")
-        if isinstance(embedding, list) and len(embedding) > 0:
-            vec = embedding[0] if isinstance(embedding[0], list) else embedding
-            if len(vec) == EMB_DIM:
-                return vec
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            embedding = data.get('embedding')
+            if embedding and len(embedding) == EMB_DIM:
+                return embedding
     except Exception as e:
-        log.debug(f"Ollama embedding failed: {e}")
+        log.debug(f"Embedding server unavailable ({e}), using fallback")
 
     # Deterministic fallback: hash-seeded random vector (reproducible per text)
     seed = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)

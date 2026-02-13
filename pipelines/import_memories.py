@@ -24,7 +24,7 @@ try:
 except ImportError:
     import memory_engine
 
-EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "768"))
+EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "384"))
 
 
 def dummy_embedding() -> list:

@@ -40,6 +40,7 @@ import time
 import logging
 import hashlib
 import argparse
+import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Set
 
@@ -63,7 +64,10 @@ log = logging.getLogger("ingest_workspace")
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "768"))
+EMB_DIM = int(os.getenv("MEMORY_EMB_DIM", "384"))
+EMBEDDING_SERVER_HOST = os.getenv('EMBEDDING_SERVER_HOST', 'localhost')
+EMBEDDING_SERVER_PORT = int(os.getenv('EMBEDDING_SERVER_PORT', '9999'))
+EMBEDDING_SERVER_URL = f"http://{EMBEDDING_SERVER_HOST}:{EMBEDDING_SERVER_PORT}"
 DEFAULT_WORKSPACE = "/root/.openclaw/workspace"
 MANIFEST_PATH = PROJECT_ROOT / "data" / "workspace_manifest.json"
 
@@ -71,6 +75,27 @@ MANIFEST_PATH = PROJECT_ROOT / "data" / "workspace_manifest.json"
 MIN_CHUNK = 200
 MAX_CHUNK = 1500
 IDEAL_CHUNK = 800
+CHUNK_OVERLAP = 200  # Characters to overlap between chunks for context preservation
+
+# Hallucination filter - disable for workspace docs since they're trusted sources
+ENABLE_HALLUCINATION_FILTER = os.getenv("DISABLE_HALLUCINATION_FILTER", "true").lower() in ("1", "true", "yes")
+
+# Try to import nltk for sentence splitting
+try:
+    import nltk
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    try:
+        nltk.download('punkt', quiet=True)
+        nltk.download('punkt_tab', quiet=True)
+    except Exception:
+        pass
+HAS_NLTK = True
+try:
+    from nltk.tokenize import sent_tokenize
+    HAS_NLTK = True
+except Exception:
+    HAS_NLTK = False
 
 # Directories to skip by default
 DEFAULT_EXCLUDES: List[str] = [
@@ -86,29 +111,21 @@ DEFAULT_EXCLUDES: List[str] = [
 # ---------------------------------------------------------------------------
 
 def embed_text(text: str) -> List[float]:
-    """Generate an embedding via Ollama nomic-embed-text.  Falls back to a
-    deterministic hash-seeded random vector so ingestion never stalls."""
+    """Generate embedding via embedding server API (384-dim).
+    Falls back to deterministic hash-seeded random vector so ingestion never stalls."""
     try:
-        import subprocess
-        payload = json.dumps({"model": "nomic-embed-text", "input": text[:2000]})
-        result = subprocess.check_output(
-            [
-                "curl", "-s", "-X", "POST",
-                "http://localhost:11434/api/embed",
-                "-d", payload,
-                "-H", "Content-Type: application/json",
-            ],
-            text=True,
-            timeout=30,
+        req = urllib.request.Request(
+            EMBEDDING_SERVER_URL,
+            data=json.dumps({'text': text[:2000]}).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
         )
-        data = json.loads(result)
-        embs = data.get("embeddings")
-        if isinstance(embs, list) and embs:
-            vec = embs[0] if isinstance(embs[0], list) else embs
-            if len(vec) == EMB_DIM:
-                return vec
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read().decode('utf-8'))
+            embedding = data.get('embedding')
+            if embedding and len(embedding) == EMB_DIM:
+                return embedding
     except Exception as e:
-        log.debug(f"Ollama embedding failed: {e}")
+        log.debug(f"Embedding server unavailable ({e}), using fallback")
 
     # Deterministic fallback
     seed = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
@@ -246,24 +263,61 @@ def semantic_split(raw: str, source_label: str = "") -> List[Dict[str, Any]]:
         hm = re.match(r"^(#{1,6}\s+.+?)$", section, re.MULTILINE)
         if hm:
             heading = hm.group(1).strip()
+            # Remove heading from the text to avoid duplication
+            section_body = re.sub(r"^#{1,6}\s+.+?\n", "", section, count=1).strip()
+        else:
+            section_body = section
 
         # If the section fits, keep it whole
         if len(section) <= MAX_CHUNK:
-            raw_chunks.append({"text": section, "heading": heading})
+            # Prepend heading to text for embedding context
+            text_with_heading = f"{heading}\n\n{section_body}" if heading else section_body
+            raw_chunks.append({"text": text_with_heading, "heading": heading})
             continue
 
-        # Sub-split on paragraphs
-        paragraphs = re.split(r"\n{2,}", section)
-        buf = ""
-        for para in paragraphs:
-            candidate = (buf + "\n\n" + para).strip() if buf else para
-            if len(candidate) > MAX_CHUNK and buf:
-                raw_chunks.append({"text": buf.strip(), "heading": heading})
-                buf = para
-            else:
-                buf = candidate
-        if buf.strip():
-            raw_chunks.append({"text": buf.strip(), "heading": heading})
+        # Sub-split using sentence tokenization if available
+        if HAS_NLTK:
+            try:
+                sentences = sent_tokenize(section_body)
+                # Group sentences into chunks
+                buf = ""
+                for sent in sentences:
+                    candidate = (buf + " " + sent).strip() if buf else sent
+                    if len(candidate) > MAX_CHUNK and buf:
+                        raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
+                        # Start new chunk with overlap from previous
+                        overlap_start = max(0, len(buf) - CHUNK_OVERLAP)
+                        buf = buf[overlap_start:] + " " + sent if overlap_start else sent
+                    else:
+                        buf = candidate
+                if buf.strip():
+                    raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
+            except Exception:
+                # Fallback to paragraph splitting
+                paragraphs = re.split(r"\n{2,}", section_body)
+                buf = ""
+                for para in paragraphs:
+                    candidate = (buf + "\n\n" + para).strip() if buf else para
+                    if len(candidate) > MAX_CHUNK and buf:
+                        raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
+                        buf = para
+                    else:
+                        buf = candidate
+                if buf.strip():
+                    raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
+        else:
+            # Fallback to paragraph splitting
+            paragraphs = re.split(r"\n{2,}", section_body)
+            buf = ""
+            for para in paragraphs:
+                candidate = (buf + "\n\n" + para).strip() if buf else para
+                if len(candidate) > MAX_CHUNK and buf:
+                    raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
+                    buf = para
+                else:
+                    buf = candidate
+            if buf.strip():
+                raw_chunks.append({"text": f"{heading}\n\n{buf}" if heading else buf, "heading": heading})
 
     # ---- Merge tiny chunks -------------------------------------------------
     merged: List[Dict[str, Any]] = []
@@ -552,6 +606,18 @@ def main():
         help="Re-ingest every file, ignoring the manifest.",
     )
     parser.add_argument(
+        "--prune-missing",
+        action="store_true",
+        help="Remove manifest entries for files that no longer exist in the workspace. "
+             "Useful for cleaning up after files/directories are deleted.",
+    )
+    parser.add_argument(
+        "--no-hallucination-filter",
+        action="store_true",
+        help="Disable hallucination filter for workspace ingestion. "
+             "Workspace docs are trusted sources, so filtering is disabled by default.",
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable debug logging.",
@@ -571,6 +637,52 @@ def main():
     if args.force and MANIFEST_PATH.is_file():
         log.info("--force: deleting existing manifest")
         MANIFEST_PATH.unlink()
+
+    # Disable hallucination filter for workspace ingestion (trusted sources)
+    if args.no_hallucination_filter:
+        os.environ['MEMORY_FILTER_HALLUCINATIONS'] = 'false'
+        log.info("Hallucination filter disabled for workspace ingestion")
+
+    # Handle --prune-missing: remove manifest entries for deleted files
+    if args.prune_missing and MANIFEST_PATH.is_file():
+        manifest = _load_manifest(MANIFEST_PATH)
+        prev_files = manifest.get("files", {})
+        chunk_ids_map = manifest.get("chunk_ids", {})
+        
+        missing_files = []
+        for rel in list(prev_files.keys()):
+            if not (workspace / rel).exists():
+                missing_files.append(rel)
+        
+        if missing_files:
+            log.info(f"--prune-missing: cleaning up {len(missing_files)} deleted file(s)")
+            
+            # Delete chunks from DB for missing files
+            if not args.dry_run:
+                all_ids_to_delete = []
+                for rel in missing_files:
+                    all_ids_to_delete.extend(chunk_ids_map.pop(rel, []))
+                    prev_files.pop(rel, None)
+                
+                if all_ids_to_delete:
+                    removed = _delete_old_chunks(all_ids_to_delete)
+                    log.info(f"  → Removed {removed} chunks from DB")
+            else:
+                for rel in missing_files:
+                    prev_files.pop(rel, None)
+                    chunk_ids_map.pop(rel, [])
+                log.info(f"  [DRY] Would remove {len(missing_files)} file entries")
+            
+            # Save cleaned manifest
+            manifest = {"files": prev_files, "chunk_ids": chunk_ids_map}
+            if not args.dry_run:
+                _save_manifest(MANIFEST_PATH, manifest)
+                log.info(f"  Manifest updated and saved")
+            
+            log.info("--prune-missing: done")
+            sys.exit(0)
+        
+        log.info("--prune-missing: no missing files found")
 
     log.info(f"Workspace        : {workspace}")
     log.info(f"Excludes         : {excludes}")

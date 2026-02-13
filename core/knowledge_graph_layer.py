@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional, List, Tuple
 
-DB_PATH = Path(__file__).with_name('kg.db')
+DB_PATH = Path(__file__).resolve().parent.parent / 'data' / 'kg.db'
 
 def _get_conn():
     conn = sqlite3.connect(DB_PATH)
