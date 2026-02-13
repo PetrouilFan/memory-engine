@@ -1,6 +1,7 @@
 # Required
 numpy
 faiss-cpu
+redis
 
 # Optional – for clustering and summaries
 scikit-learn
@@ -8,3 +9,21 @@ hdbscan
 
 # Optional – for PostgreSQL backend
 sqlalchemy
+
+# Web framework
+fastapi
+uvicorn
+pydantic
+
+# ML/NLP
+sentence-transformers
+
+# Testing
+pytest
+
+# HTTP clients
+requests
+httpx
+
+# Environment
+python-dotenv
