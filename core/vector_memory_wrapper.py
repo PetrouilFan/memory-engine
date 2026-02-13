@@ -35,6 +35,16 @@ DB_PATH = os.getenv('MEMORY_DB_PATH', os.path.join(_ME_DATA, 'memory.db'))
 INDEX_PATH = os.getenv('MEMORY_INDEX_PATH', os.path.join(_ME_DATA, 'memory.index'))
 EMB_DIM = int(os.getenv('MEMORY_EMB_DIM', '384'))
 
+# ---- FAISS Index Optimization Settings ----
+INDEX_TYPE = os.getenv('FAISS_INDEX_TYPE', 'FlatIP').upper()
+HNSW_M = int(os.getenv('FAISS_HNSW_M', '32'))
+HNSW_EF_CONSTRUCTION = int(os.getenv('FAISS_HNSW_EF_CONSTRUCTION', '200'))
+HNSW_EF_SEARCH = int(os.getenv('FAISS_HNSW_EF_SEARCH', '50'))
+IVF_NLIST = int(os.getenv('FAISS_IVF_NLIST', '100'))
+IVF_NPROBE = int(os.getenv('FAISS_IVF_NPROBE', '10'))
+
+_use_gpu = os.getenv('FAISS_USE_GPU', 'false').lower() == 'true'
+
 _lock = threading.Lock()
 
 # ---------- FAISS index ----------

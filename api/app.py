@@ -1,17 +1,38 @@
 """FastAPI wrapper for the memory_engine module.
 Provides HTTP endpoints to add memories, perform hybrid search, and retrieve stats.
+
+Production-ready with:
+- CORS middleware
+- Rate limiting
+- Structured logging with correlation IDs
+- Global exception handlers
+- Security headers
 """
 
 import os
+import uuid
+import time
+import json
+import logging
 from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional
+from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Header, Request, status
+from fastapi import FastAPI, HTTPException, Header, Request, Response, status
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field, field_validator
 from pydantic.types import conint
 import uvicorn
-import logging
+
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    SLOWAPI_AVAILABLE = True
+except ImportError:
+    SLOWAPI_AVAILABLE = False
 
 from ..core.memory_engine import (
     add_memory,
@@ -30,8 +51,118 @@ MAX_REQUEST_SIZE = 10 * 1024 * 1024
 MAX_BATCH_SIZE = 1000
 MAX_TOP_K = 1000
 
-logging.basicConfig(level=logging.INFO)
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+DEBUG_MODE = os.getenv("DEBUG", "false").lower() == "true"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+if SLOWAPI_AVAILABLE:
+    limiter = Limiter(key_func=get_remote_address)
+else:
+    limiter = None
+
+
+class Settings:
+    """Application settings using pydantic-settings pattern."""
+    MEMORY_EMB_DIM: int = 384
+    MEMORY_API_ADMIN_TOKEN: str = ""
+    MAX_REQUEST_SIZE: int = 10 * 1024 * 1024
+    MAX_BATCH_SIZE: int = 1000
+    CORS_ORIGINS: List[str] = ["*"]
+    DEBUG: bool = False
+    RATE_LIMIT_PER_MINUTE: int = 60
+
+
+settings = Settings()
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: str
+    request_id: Optional[str] = None
+    timestamp: str
+
+
+def generate_request_id() -> str:
+    return str(uuid.uuid4())
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Add correlation ID to each request for tracing."""
+    request_id = request.headers.get("X-Request-ID", generate_request_id())
+    request.state.request_id = request_id
+    
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = str(process_time)
+    
+    logger.info(
+        f"method={request.method} path={request.url.path} "
+        f"status={response.status_code} duration={process_time:.3f}s "
+        f"request_id={request_id}"
+    )
+    
+    return response
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Add security headers to responses."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
+async def check_request_size(request: Request, call_next):
+    """Limit request body size."""
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > MAX_REQUEST_SIZE:
+            return JSONResponse(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                content={
+                    "error": "Request too large",
+                    "detail": f"Maximum size is {MAX_REQUEST_SIZE} bytes"
+                }
+            )
+    response = await call_next(request)
+    return response
+
+
+if SLOWAPI_AVAILABLE:
+    app.state.limiter = limiter
+
+    @app.exception_handler(RateLimitExceeded)
+    async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={
+                "error": "Rate limit exceeded",
+                "detail": str(exc),
+                "retry_after": getattr(exc, "retry_after", 60)
+            }
+        )
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def validate_vector_dimension(vector: List[float]) -> None:
@@ -56,9 +187,48 @@ async def verify_admin_token(x_admin_token: Optional[str] = Header(None)) -> str
     return x_admin_token
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with proper error response."""
+    request_id = getattr(request.state, "request_id", None)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "status_code": exc.status_code,
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions - log full error, return sanitized response."""
+    request_id = getattr(request.state, "request_id", None)
+    
+    logger.error(
+        f"Unhandled exception: {type(exc).__name__}: {exc}",
+        exc_info=True,
+        extra={"request_id": request_id}
+    )
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal server error",
+            "detail": "An unexpected error occurred" if not DEBUG_MODE else str(exc),
+            "request_id": request_id,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"Memory Engine API started with EMB_DIM={MEMORY_EMB_DIM}")
+    logger.info(f"Debug mode: {DEBUG_MODE}")
+    logger.info(f"CORS origins: {CORS_ORIGINS}")
     yield
     logger.info("Memory Engine API shutting down")
 
@@ -66,21 +236,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Memory Engine API",
     version="1.0",
-    lifespan=lifespan
+    lifespan=lifespan,
+    docs_url="/docs" if DEBUG_MODE else None,
+    redoc_url="/redoc" if DEBUG_MODE else None,
+    openapi_url="/openapi.json" if DEBUG_MODE else None,
 )
-
-
-@app.middleware("http")
-async def check_request_size(request: Request, call_next):
-    if request.method in ("POST", "PUT", "PATCH"):
-        content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE:
-            return JSONResponse(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                content={"detail": f"Request too large. Maximum size is {MAX_REQUEST_SIZE} bytes"}
-            )
-    response = await call_next(request)
-    return response
 
 
 class AddMemoryRequest(BaseModel):
@@ -105,27 +265,34 @@ class ValidationErrorResponse(BaseModel):
     detail: str
 
 
-@app.post(
-    "/add_memory",
-    response_model=AddMemoryResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
-def api_add_memory(req: AddMemoryRequest):
-    try:
-        mem_id = add_memory(req.vector, req.metadata, text=req.text or "", weight=req.weight or 1.0)
-        if mem_id == -1:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Memory rejected as hallucination")
-        return {"memory_id": mem_id}
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Runtime error: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error in add_memory: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
+if SLOWAPI_AVAILABLE:
+    @app.post("/add_memory")
+    @limiter.limit("60/minute")
+    async def api_add_memory(request: Request, req: AddMemoryRequest):
+        try:
+            mem_id = add_memory(req.vector, req.metadata, text=req.text or "", weight=req.weight or 1.0)
+            if mem_id == -1:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Memory rejected as hallucination")
+            return {"memory_id": mem_id}
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Runtime error: {str(e)}")
+else:
+    @app.post("/add_memory", response_model=AddMemoryResponse)
+    def api_add_memory(req: AddMemoryRequest):
+        try:
+            mem_id = add_memory(req.vector, req.metadata, text=req.text or "", weight=req.weight or 1.0)
+            if mem_id == -1:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Memory rejected as hallucination")
+            return {"memory_id": mem_id}
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Runtime error: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error in add_memory: {type(e).__name__}: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
 class AddBatchRequest(BaseModel):
@@ -159,14 +326,7 @@ class AddBatchResponse(BaseModel):
     memory_ids: List[int]
 
 
-@app.post(
-    "/add_memories_batch",
-    response_model=AddBatchResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/add_memories_batch", response_model=AddBatchResponse)
 def api_add_memories_batch(req: AddBatchRequest):
     try:
         ids = add_memories_batch(req.vectors, req.metadatas, texts=req.texts)
@@ -206,14 +366,7 @@ class SearchResponse(BaseModel):
     results: List[SearchResult]
 
 
-@app.post(
-    "/search",
-    response_model=SearchResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/search", response_model=SearchResponse)
 def api_search(req: SearchRequest):
     try:
         results = hybrid_search(
@@ -233,12 +386,7 @@ def api_search(req: SearchRequest):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@app.get(
-    "/stats",
-    responses={
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.get("/stats")
 def api_stats():
     try:
         return get_stats()
@@ -259,14 +407,7 @@ class PruneResponse(BaseModel):
     pruned: int
 
 
-@app.post(
-    "/prune",
-    response_model=PruneResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/prune", response_model=PruneResponse)
 def api_prune(req: PruneRequest):
     try:
         count = prune_memories(
@@ -293,14 +434,7 @@ class ConsolidateResponse(BaseModel):
     created_ids: List[int]
 
 
-@app.post(
-    "/consolidate",
-    response_model=ConsolidateResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/consolidate", response_model=ConsolidateResponse)
 def api_consolidate(req: ConsolidateRequest):
     try:
         ids = consolidate_memories(min_cluster_size=req.min_cluster_size)
@@ -323,14 +457,7 @@ class UpdateRelevanceResponse(BaseModel):
     updated: bool
 
 
-@app.post(
-    "/update_relevance",
-    response_model=UpdateRelevanceResponse,
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/update_relevance", response_model=UpdateRelevanceResponse)
 def api_update_relevance(req: UpdateRelevanceRequest):
     try:
         ok = update_relevance(req.memory_id, req.new_relevance)
@@ -348,13 +475,7 @@ def api_update_relevance(req: UpdateRelevanceRequest):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@app.get(
-    "/list_memories",
-    responses={
-        422: {"model": ValidationErrorResponse, "description": "Validation error"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.get("/list_memories")
 def api_list_memories(offset: conint(ge=0) = 0, limit: conint(ge=1, le=1000) = 100):
     from ..core.vector_memory_wrapper import list_memories_by_age
     try:
@@ -376,13 +497,7 @@ def api_list_memories(offset: conint(ge=0) = 0, limit: conint(ge=1, le=1000) = 1
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@app.post(
-    "/admin/force_save",
-    responses={
-        401: {"model": ValidationErrorResponse, "description": "Unauthorized"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/admin/force_save")
 async def api_force_save(x_admin_token: Optional[str] = Header(None)):
     try:
         verify_admin_token(x_admin_token)
@@ -398,13 +513,7 @@ async def api_force_save(x_admin_token: Optional[str] = Header(None)):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal server error")
 
 
-@app.post(
-    "/admin/shutdown",
-    responses={
-        401: {"model": ValidationErrorResponse, "description": "Unauthorized"},
-        503: {"model": ValidationErrorResponse, "description": "Service unavailable"}
-    }
-)
+@app.post("/admin/shutdown")
 async def api_shutdown(x_admin_token: Optional[str] = Header(None)):
     try:
         verify_admin_token(x_admin_token)
@@ -416,7 +525,6 @@ async def api_shutdown(x_admin_token: Optional[str] = Header(None)):
 
 
 async def shutdown_server():
-    import asyncio
     await asyncio.sleep(1)
     import sys
     sys.exit(0)

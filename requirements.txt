@@ -15,6 +15,9 @@ fastapi
 uvicorn
 pydantic
 
+# Rate limiting
+slowapi
+
 # ML/NLP
 sentence-transformers
 
