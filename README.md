@@ -47,6 +47,48 @@ Memory Engine solves all of this. It stores memories as vectors (embeddings), ap
 
 ---
 
+## 🕸️ Knowledge Graph
+
+The Knowledge Graph stores structured triples (subject → predicate → object) for reasoning about relationships between skills, tools, services, and entities.
+
+### Features
+
+- **Entity Types**: Automatically detects types (skill, tool, service, file, api, cron)
+- **Rich Relationships**: Uses, depends_on, has_command, created, fixed, installed, etc.
+- **Multi-Source Extraction**: Extracts from MEMORY.md, daily logs, TOOLS.md, skills, TASKS.md
+- **Memory Integration**: KG context is injected into LLM prompts via memory_bridge
+- **Visualization**: Interactive graph view at `/knowledge-graph` (dashboard)
+
+### Usage
+
+```bash
+# Query knowledge graph
+python3 core/kg_recall.py "browser skill"
+
+# Update knowledge graph
+python3 update_kg.py
+```
+
+### API
+
+```bash
+# Search with KG context
+curl -X POST http://localhost:8000/search-kg \
+  -H "Content-Type: application/json" \
+  -d '{"query": "how does browser work", "top_k": 5}'
+```
+
+### Data Sources
+
+The exporter extracts triples from:
+- `MEMORY.md` - Structured bullet points
+- `memory/*.md` - Daily session logs  
+- `TOOLS.md` - Tool definitions
+- `skills/*/SKILL.md` - Skill commands
+- `TASKS.md` - Task definitions
+
+---
+
 ## 📁 Project Structure
 
 ```
@@ -59,7 +101,8 @@ memory-engine/
 │   ├── hallucination_filter.py        # Hallucination detection & filtering
 │   ├── semantic_graph.py              # Concept graph layer
 │   ├── clustering.py                  # DBSCAN/HDBSCAN clustering
-│   ├── knowledge_graph_layer.py       # Triple-store (subject/predicate/object)
+│   ├── knowledge_graph_layer.py        # Triple-store (subject/predicate/object)
+│   ├── kg_recall.py                   # Knowledge graph enhanced context
 │   ├── mem_fast_layer.py              # Fast-path memory layer
 │   └── postgres_support.py            # Optional PostgreSQL backend
 │
@@ -76,6 +119,8 @@ memory-engine/
 │
 ├── tools/                             # Utilities
 │   └── memory_slice.py                # File-slicing utility with symbol lookup
+│
+├── update_kg.py                       # Periodic KG sync script
 │
 ├── evaluation/                        # Benchmarking & telemetry
 │   ├── run_evaluation.py              # Precision@k eval against gold queries
@@ -340,6 +385,8 @@ The FastAPI server (`api.py`) exposes a clean REST interface:
 | `/add_memory` | POST | Add a single memory (vector + metadata + optional text) |
 | `/add_memories_batch` | POST | Batch add multiple memories |
 | `/search` | POST | Hybrid vector + keyword search |
+| `/search-kg` | POST | Hybrid search + Knowledge Graph context |
+| `/kg-stats` | GET | Knowledge graph statistics |
 | `/stats` | GET | Memory store statistics |
 | `/admin/force_save` | POST | Force-save FAISS index (requires admin token) |
 | `/admin/shutdown` | POST | Clean shutdown (requires admin token) |
