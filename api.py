@@ -154,6 +154,54 @@ def api_search(payload: SearchRequest = Body(...)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/search-kg", response_model=Dict[str, Any])
+def api_search_kg(payload: SearchRequest = Body(...)):
+    """Hybrid search with Knowledge Graph context.
+    
+    Returns memory results plus KG context that can be injected into LLM prompts.
+    
+    Response contains:
+    - memory_results: standard hybrid search results
+    - kg_context: knowledge graph triples relevant to query
+    - combined_context: formatted string for LLM prompt injection
+    """
+    try:
+        from .core.kg_recall import kg_enhanced_search, get_kg_context
+        
+        memory_results = hybrid_search(
+            query=payload.query,
+            query_vec=payload.query_vector,
+            top_k=payload.top_k,
+            alpha=payload.alpha,
+            min_score=payload.min_score,
+        )
+        
+        enhanced = kg_enhanced_search(
+            query=payload.query,
+            memory_results=memory_results,
+            max_kg_triples=payload.top_k
+        )
+        
+        return enhanced
+    except ImportError as e:
+        logger.warning(f"KG recall not available: {e}")
+        return {"error": "Knowledge graph not available", "memory_results": memory_results}
+    except Exception as e:
+        logger.exception("search-kg failed")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/kg-stats", response_model=Dict[str, Any])
+def api_kg_stats():
+    """Return knowledge graph statistics."""
+    try:
+        from .core.knowledge_graph_layer import get_stats
+        return get_stats()
+    except Exception as e:
+        logger.exception("kg_stats failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/stats", response_model=Dict[str, Any])
 def api_stats():
     """Return basic statistics about the memory store."""

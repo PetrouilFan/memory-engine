@@ -13,10 +13,19 @@ try:
     from core.redshifted_recall import redshifted_recall
     from core.hallucination_filter import HallucinationDetector
     from core.text_sanitizer import get_sanitizer
+    from core.kg_recall import get_kg_context, format_kg_context_for_prompt
 except ImportError:
-    redshifted_recall = None
-    HallucinationDetector = None
-    get_sanitizer = None
+    try:
+        from .core.redshifted_recall import redshifted_recall
+        from .core.hallucination_filter import HallucinationDetector
+        from .core.text_sanitizer import get_sanitizer
+        from .core.kg_recall import get_kg_context, format_kg_context_for_prompt
+    except ImportError:
+        redshifted_recall = None
+        HallucinationDetector = None
+        get_sanitizer = None
+        get_kg_context = None
+        format_kg_context_for_prompt = None
 
 app = FastAPI(title="OpenClaw Groq Memory Bridge")
 
@@ -27,6 +36,7 @@ BRIDGE_PORT = int(os.getenv("BRIDGE_PORT", "19192"))
 MEMORY_RECALL_K = int(os.getenv("MEMORY_RECALL_K", "3"))
 MEMORY_RECALL_THRESHOLD = float(os.getenv("MEMORY_RECALL_THRESHOLD", "0.3"))
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY", "")
+USE_KG_CONTEXT = os.getenv("USE_KG_CONTEXT", "true").lower() == "true"
 
 detector = HallucinationDetector() if HallucinationDetector else None
 sanitizer = get_sanitizer() if get_sanitizer else None
@@ -104,12 +114,33 @@ async def chat_proxy(request: Request):
                 else:
                     m["content"] = str(m.get("content", "")) + injection
                 break
+    
+    kg_context_str = ""
+    if USE_KG_CONTEXT and get_kg_context and recall_query:
+        try:
+            kg_ctx = get_kg_context(recall_query, max_triples=5)
+            kg_context_str = format_kg_context_for_prompt(kg_ctx)
+            if kg_context_str:
+                kg_injection = kg_context_str
+                for m in reversed(messages):
+                    if m.get("role") == "assistant":
+                        if isinstance(m.get("content"), str):
+                            m["content"] = kg_injection + "\n" + m["content"]
+                        elif isinstance(m.get("content"), list):
+                            m["content"].insert(0, {"type": "text", "text": kg_injection + "\n"})
+                        break
+        except Exception as e:
+            logger.warning(f"KG context failed: {e}")
 
     if valid_memories:
         logger.info("=== MEMORY-AUGMENTED PROMPT === memories_count=%d, query_length=%d", 
                     len(valid_memories), len(recall_query))
-    else:
+    if kg_context_str:
+        logger.info("=== KG CONTEXT ADDED === query: %s", recall_query[:80])
+    elif valid_memories:
         logger.info("=== NO MEMORIES MATCHED === query: %s", recall_query[:120])
+    else:
+        logger.info("=== NO CONTEXT ADDED === query: %s", recall_query[:120])
 
     is_streaming = payload.get("stream", False)
     payload["model"] = TARGET_MODEL
