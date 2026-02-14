@@ -1,5 +1,5 @@
 # Knowledge-Graph Exporter
-# Scans MEMORY.md and daily logs to extract simple entity-relationship triples.
+# Scans MEMORY.md and daily logs to extract entity-relationship triples.
 # Output is a CSV file with columns: subject, predicate, object, source_file.
 
 import os
@@ -7,20 +7,58 @@ import re
 import csv
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MEMORY_FILE = PROJECT_ROOT / "MEMORY.md"
-MEMORY_DIR = PROJECT_ROOT / "memory"
-OUTPUT = PROJECT_ROOT / "data" / "knowledge_graph.csv"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+MEMORY_FILE = Path("/root/.openclaw/workspace/MEMORY.md")
+MEMORY_DIR = Path("/root/.openclaw/workspace/memory")
+OUTPUT = PROJECT_ROOT / "projects/memory-engine/data" / "knowledge_graph.csv"
 
-TRIPLE_REGEX = re.compile(r"(?P<subj>\w+)\s+(?P<pred>\w+)\s+(?P<obj>\w+)")
+ACTION_VERBS = [
+    'added', 'created', 'fixed', 'updated', 'implemented', 'removed',
+    'patched', 'disabled', 'installed', 'wired', 'configured',
+    'improved', 'refactored', 'enhanced', 'resolved', 'replaced'
+]
+
+def clean_object(text):
+    text = text.strip()
+    text = re.sub(r'^[-*]\s*', '', text)
+    text = re.sub(r'^(\d+\.)\s*', '', text)
+    text = text.strip('.,;:')
+    return text
+
+def extract_from_line(line, source, triples):
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return
+    
+    line_clean = re.sub(r'^\d{4}-\d{2}-\d{2}:\s*', '', line)
+    
+    for verb in ACTION_VERBS:
+        pattern = rf'^{verb}\s+(.+)$'
+        m = re.match(pattern, line_clean, re.IGNORECASE)
+        if m:
+            obj = clean_object(m.group(1))
+            if obj and len(obj) > 1:
+                obj = obj[:100]
+                triples.append(('agent', verb, obj, source))
+            return
 
 
 def extract_triples(text, source):
     triples = []
     for line in text.splitlines():
-        m = TRIPLE_REGEX.search(line)
-        if m:
-            triples.append((m.group('subj'), m.group('pred'), m.group('obj'), source))
+        line = line.strip()
+        
+        if line.startswith('- ') or line.startswith('* '):
+            content = line[2:]
+            if content.startswith('- ') or content.startswith('* '):
+                content = content[2:]
+            extract_from_line(content, source, triples)
+        elif line.startswith('  - ') or line.startswith('  * '):
+            content = line[4:]
+            extract_from_line(content, source, triples)
+        else:
+            extract_from_line(line, source, triples)
+    
     return triples
 
 
